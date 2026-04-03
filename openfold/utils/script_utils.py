@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+from typing import Optional
 
 import numpy
 import torch
@@ -34,7 +35,6 @@ from pytorch_lightning.utilities.deepspeed import (
     convert_zero_checkpoint_to_fp32_state_dict
 )
 
-from .tensorrt_utils import instrument_with_trt_compile
 from .precision_utils import wrap_for_precision
 
 logging.basicConfig()
@@ -69,13 +69,138 @@ def make_output_directory(output_dir, model_name, multiple_model_mode):
 
 def _accelerate(model, config):
     if config.trt.mode is not None:
+        # Lazy import: tensorrt_utils pulls NVIDIA TensorRT/cuda Python bindings; omit on ROCm
+        # and other stacks where `cuda` is not installed.
+        from .tensorrt_utils import instrument_with_trt_compile
+
         instrument_with_trt_compile(model, config)
     if config.precision is not None and config.precision in ['bf16', 'fp16']:
         model.evoformer = wrap_for_precision(model.evoformer, config.precision)
         model.extra_msa_stack = wrap_for_precision(model.extra_msa_stack, config.precision)
 
 
-def load_models_from_command_line(config, model_device, openfold_checkpoint_path, jax_param_path, output_dir):
+def _default_inductor_cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache"))
+    return os.path.join(base, "openfold", "torch_inductor")
+
+
+def _prepare_inductor_cache_dir(
+    cache_dir: str,
+    checkpoint_path: Optional[str],
+    force_rebuild: bool,
+) -> None:
+    os.makedirs(cache_dir, exist_ok=True)
+    if force_rebuild:
+        import shutil
+
+        for name in os.listdir(cache_dir):
+            path = os.path.join(cache_dir, name)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except OSError as e:
+                logger.warning("Could not remove %s: %s", path, e)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    meta_path = os.path.join(cache_dir, ".openfold_inductor_cache_meta.json")
+    meta = {
+        "checkpoint_path": checkpoint_path,
+        "torch_version": torch.__version__,
+    }
+    if checkpoint_path and os.path.isfile(checkpoint_path):
+        st = os.stat(checkpoint_path)
+        meta["checkpoint_mtime"] = st.st_mtime
+        meta["checkpoint_size"] = st.st_size
+    try:
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+    except OSError as e:
+        logger.warning("Could not write Inductor cache meta: %s", e)
+
+
+def maybe_apply_torch_compile(
+    model,
+    torch_compile: bool,
+    torch_inductor_cache_dir: Optional[str],
+    checkpoint_path_for_cache_key: Optional[str],
+    force_inductor_cache_rebuild: bool,
+    torch_compile_strategy: str = "full",
+    torch_compile_evoformer_mode: Optional[str] = None,
+    torch_compile_structure_module_mode: Optional[str] = None,
+    torch_compile_submodule_mode: Optional[str] = None,
+    torch_inductor_no_static_launcher: bool = False,
+):
+    """
+    Optionally wrap the model (or major submodules) with torch.compile.
+    Sets TORCHINDUCTOR_CACHE_DIR for Inductor disk cache persistence.
+    """
+    if not torch_compile:
+        return model
+
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is not available in this PyTorch build.")
+
+    cache_dir = torch_inductor_cache_dir or _default_inductor_cache_dir()
+    _prepare_inductor_cache_dir(cache_dir, checkpoint_path_for_cache_key, force_inductor_cache_rebuild)
+
+    if torch_inductor_no_static_launcher:
+        import torch._inductor.config as inductor_config
+
+        inductor_config.use_static_triton_launcher = False
+        logger.info("torch._inductor: use_static_triton_launcher=False (ROCm / driver 301 workaround)")
+
+    if torch.version.hip is not None:
+        logger.warning(
+            "torch.compile on ROCm/HIP can be unstable; if you see Triton/Inductor errors, "
+            "try --torch_inductor_no_static_launcher or disable --torch_compile."
+        )
+
+    def _compile(mod, mode: Optional[str]):
+        kwargs = {}
+        if mode is not None:
+            kwargs["mode"] = mode
+        return torch.compile(mod, **kwargs)
+
+    if torch_compile_strategy == "full":
+        mode = torch_compile_evoformer_mode
+        logger.info("torch.compile: strategy=full%s", f", mode={mode}" if mode else "")
+        return _compile(model, mode)
+
+    if torch_compile_strategy == "submodules":
+        evo_m = torch_compile_evoformer_mode
+        sm_m = torch_compile_structure_module_mode
+        aux_m = torch_compile_submodule_mode
+        logger.info(
+            "torch.compile: strategy=submodules (evoformer mode=%s, structure_module mode=%s, aux_heads mode=%s)",
+            evo_m,
+            sm_m,
+            aux_m,
+        )
+        model.evoformer = _compile(model.evoformer, evo_m)
+        model.structure_module = _compile(model.structure_module, sm_m)
+        model.aux_heads = _compile(model.aux_heads, aux_m)
+        return model
+
+    raise ValueError(f"Unknown torch_compile_strategy: {torch_compile_strategy!r}")
+
+
+def load_models_from_command_line(
+    config,
+    model_device,
+    openfold_checkpoint_path,
+    jax_param_path,
+    output_dir,
+    *,
+    torch_compile: bool = False,
+    torch_inductor_cache_dir: Optional[str] = None,
+    force_inductor_cache_rebuild: bool = False,
+    torch_compile_strategy: str = "full",
+    torch_compile_evoformer_mode: Optional[str] = None,
+    torch_compile_structure_module_mode: Optional[str] = None,
+    torch_compile_submodule_mode: Optional[str] = None,
+    torch_inductor_no_static_launcher: bool = False,
+):
     # Create the output directory
 
     multiple_model_mode = count_models_to_evaluate(openfold_checkpoint_path, jax_param_path) > 1
@@ -97,6 +222,18 @@ def load_models_from_command_line(config, model_device, openfold_checkpoint_path
             )
             output_directory = make_output_directory(output_dir, model_basename, multiple_model_mode)
             _accelerate(model, config)
+            model = maybe_apply_torch_compile(
+                model,
+                torch_compile,
+                torch_inductor_cache_dir,
+                path,
+                force_inductor_cache_rebuild,
+                torch_compile_strategy=torch_compile_strategy,
+                torch_compile_evoformer_mode=torch_compile_evoformer_mode,
+                torch_compile_structure_module_mode=torch_compile_structure_module_mode,
+                torch_compile_submodule_mode=torch_compile_submodule_mode,
+                torch_inductor_no_static_launcher=torch_inductor_no_static_launcher,
+            )
             yield model, output_directory
 
     if openfold_checkpoint_path:
@@ -133,6 +270,18 @@ def load_models_from_command_line(config, model_device, openfold_checkpoint_path
             )
             output_directory = make_output_directory(output_dir, checkpoint_basename, multiple_model_mode)
             _accelerate(model, config)
+            model = maybe_apply_torch_compile(
+                model,
+                torch_compile,
+                torch_inductor_cache_dir,
+                ckpt_path,
+                force_inductor_cache_rebuild,
+                torch_compile_strategy=torch_compile_strategy,
+                torch_compile_evoformer_mode=torch_compile_evoformer_mode,
+                torch_compile_structure_module_mode=torch_compile_structure_module_mode,
+                torch_compile_submodule_mode=torch_compile_submodule_mode,
+                torch_inductor_no_static_launcher=torch_inductor_no_static_launcher,
+            )
             yield model, output_directory
 
     if not jax_param_path and not openfold_checkpoint_path:
@@ -150,7 +299,7 @@ def parse_fasta(data):
     ][1:]
     tags, seqs = lines[::2], lines[1::2]
 
-    tags = [re.split('\W| \|', t)[0] for t in tags]
+    tags = [re.split(r"\W| \|", t)[0] for t in tags]
 
     return tags, seqs
 

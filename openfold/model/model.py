@@ -231,6 +231,10 @@ class AlphaFold(nn.Module):
         # Controls whether the model uses in-place operations throughout
         # The dual condition accounts for activation checkpoints
         inplace_safe = not (self.training or torch.is_grad_enabled())
+        # attn_core_inplace_cuda (structure_module IPA) is NVIDIA-only; ROCm/HIP and
+        # CPU inference must use the standard softmax path instead.
+        if device.type == "cpu" or torch.version.hip is not None:
+            inplace_safe = False
 
         # Prep some features
         seq_mask = feats["seq_mask"]

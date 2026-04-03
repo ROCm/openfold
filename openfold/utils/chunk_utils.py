@@ -25,6 +25,13 @@ from openfold.utils.tensor_utils import (
 )
 
 
+def _dynamo_disable_if_available(fn):
+    d = getattr(torch, "_dynamo", None)
+    if d is not None and hasattr(d, "disable"):
+        return d.disable(fn)
+    return fn
+
+
 def _fetch_dims(tree):
     shapes = []
     tree_type = type(tree)
@@ -402,6 +409,7 @@ class ChunkSizeTuner:
 
         return consistent
 
+    @_dynamo_disable_if_available
     def tune_chunk_size(self,
         representative_fn: Callable,
         args: Tuple[Any],
