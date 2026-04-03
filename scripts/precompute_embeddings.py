@@ -126,7 +126,7 @@ class EmbeddingGenerator:
                     toks = toks.to(device="cuda", non_blocking=True)
                 
                 if self.truncate:
-                    toks = toks[:1022]
+                    toks = toks[:, :1022]
                 
                 out = self.model(toks, repr_layers=repr_layers, return_contacts=False)
 
