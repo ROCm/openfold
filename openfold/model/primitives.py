@@ -27,8 +27,17 @@ if ds4s_is_installed:
 
 fa_is_installed = importlib.util.find_spec("flash_attn") is not None
 if fa_is_installed:
-    from flash_attn.bert_padding import unpad_input
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    try:
+        from flash_attn.bert_padding import unpad_input
+        from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    except (ImportError, ModuleNotFoundError):
+        # Flash Attention installed but not compatible (e.g., wrong PyTorch version or ROCm)
+        fa_is_installed = False
+        unpad_input = None
+        flash_attn_unpadded_kvpacked_func = None
+else:
+    unpad_input = None
+    flash_attn_unpadded_kvpacked_func = None
 
 import torch
 import torch.nn as nn
@@ -766,9 +775,9 @@ def _lma(
 
 @torch.jit.ignore
 def _flash_attn(q, k, v, kv_mask):
-    if not fa_is_installed:
+    if not fa_is_installed or flash_attn_unpadded_kvpacked_func is None:
         raise ValueError(
-            "_flash_attn requires that FlashAttention be installed"
+            "_flash_attn requires that FlashAttention be installed and compatible"
         )
    
     batch_dims = q.shape[:-3]

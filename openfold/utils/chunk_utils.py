@@ -18,6 +18,14 @@ from typing import Tuple, List, Callable, Any, Dict, Sequence, Optional
 
 import torch
 
+try:
+    _dynamo_disable = torch._dynamo.disable
+except (AttributeError, ModuleNotFoundError):
+
+    def _dynamo_disable(fn):
+        return fn
+
+
 from openfold.utils.tensor_utils import (
     tree_map,
     tensor_tree_map,
@@ -399,6 +407,7 @@ class ChunkSizeTuner:
 
         return consistent
 
+    @_dynamo_disable
     def tune_chunk_size(self,
         representative_fn: Callable,
         args: Tuple[Any],

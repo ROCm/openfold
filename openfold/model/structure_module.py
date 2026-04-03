@@ -437,11 +437,15 @@ class InvariantPointAttention(nn.Module):
             del pt_att
             a += square_mask.unsqueeze(-3)
             # in-place softmax
-            attn_core_inplace_cuda.forward_(
-                a,
-                reduce(mul, a.shape[:-1]),
-                a.shape[-1],
-            )
+            try:
+                attn_core_inplace_cuda.forward_(
+                    a,
+                    reduce(mul, a.shape[:-1]),
+                    a.shape[-1],
+                )
+            except RuntimeError:
+                # CUDA kernel not available (e.g., on ROCm), use regular softmax
+                a = self.softmax(a)
         else:
             a = a + pt_att
             a = a + square_mask.unsqueeze(-3)

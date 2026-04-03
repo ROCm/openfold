@@ -21,6 +21,8 @@ import pickle
 import random
 import time
 import json
+import datetime
+import sys
 
 logging.basicConfig()
 logger = logging.getLogger(__file__)
@@ -124,6 +126,63 @@ def round_up_seqlen(seqlen):
     return int(math.ceil(seqlen / TRACING_INTERVAL)) * TRACING_INTERVAL
 
 
+def round_up_seqlen_multiple(seqlen, multiple):
+    """Round sequence length up to the next multiple of ``multiple`` (bucket padding)."""
+    if multiple is None or multiple <= 0:
+        return seqlen
+    return int(math.ceil(seqlen / multiple)) * multiple
+
+
+def write_run_metadata(args, output_dir):
+    """
+    Write run metadata to a JSON file alongside timings.json.
+    Captures all command-line arguments and environment info for analysis.
+    
+    Args:
+        args: Parsed command-line arguments
+        output_dir: Output directory where metadata will be written
+    """
+    metadata = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "command_line": " ".join(sys.argv),
+        "arguments": {}
+    }
+    
+    # Capture all argparse arguments
+    # Convert args namespace to dict, filtering out non-serializable objects
+    for key, value in vars(args).items():
+        # Skip functions, modules, and other non-serializable objects
+        if not callable(value) and not hasattr(value, '__module__'):
+            try:
+                # Test if it's JSON serializable
+                json.dumps(value)
+                metadata["arguments"][key] = value
+            except (TypeError, ValueError):
+                # If not serializable, convert to string
+                metadata["arguments"][key] = str(value)
+    
+    # Add environment info
+    metadata["environment"] = {
+        "python_version": sys.version.split()[0],
+        "pytorch_version": torch.__version__,
+    }
+    
+    # Add ROCm version if available
+    if hasattr(torch.version, 'hip'):
+        metadata["environment"]["rocm_version"] = torch.version.hip
+    
+    # Write to same directory as timings.json
+    metadata_file = os.path.join(output_dir, "run_metadata.json")
+    try:
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"Run metadata written to: {metadata_file}")
+    except Exception as e:
+        logger.warning(f"Failed to write run metadata: {e}")
+    
+    return metadata_file
+
+
 def generate_feature_dict(
     tags,
     seqs,
@@ -175,6 +234,9 @@ def list_files_with_extensions(dir, extensions):
 def main(args):
     # Create the output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Write run metadata (captures all command-line arguments and environment info)
+    write_run_metadata(args, args.output_dir)
 
     if args.config_preset.startswith("seq"):
         args.use_single_seq_mode = True
@@ -200,6 +262,20 @@ def main(args):
             raise ValueError(
                 "Tracing requires that fixed_size mode be enabled in the config"
             )
+
+    if args.trace_model and args.torch_compile:
+        logger.warning(
+            "Both --trace_model and --torch_compile are enabled; combining "
+            "TorchScript tracing with torch.compile can be unsupported or "
+            "redundant. Prefer one or the other unless you have verified this stack."
+        )
+
+    if args.pad_seqlen_multiple > 0 and not args.torch_compile:
+        logger.info(
+            "--pad_seqlen_multiple is set without --torch_compile: shape bucketing "
+            "mainly helps torch.compile/Inductor reuse; eager mode sees little "
+            "kernel-cache benefit (extra padding still adds compute)."
+        )
 
     is_multimer = "multimer" in args.config_preset
 
@@ -283,7 +359,16 @@ def main(args):
         args.model_device,
         args.openfold_checkpoint_path,
         args.jax_param_path,
-        args.output_dir)
+        args.output_dir,
+        torch_compile=args.torch_compile,
+        torch_inductor_cache_dir=args.torch_inductor_cache_dir,
+        force_inductor_cache_rebuild=args.torch_inductor_cache_force_rebuild,
+        torch_compile_strategy=args.torch_compile_strategy,
+        torch_compile_evoformer_mode=args.torch_compile_evoformer_mode,
+        torch_compile_structure_module_mode=args.torch_compile_structure_module_mode,
+        torch_compile_submodule_mode=args.torch_compile_submodule_mode,
+        torch_inductor_no_static_launcher=args.torch_inductor_no_static_launcher,
+    )
 
     for model, output_directory in model_generator:
         cur_tracing_interval = 0
@@ -305,12 +390,23 @@ def main(args):
                     args,
                 )
 
-                if args.trace_model:
-                    n = feature_dict["aatype"].shape[-2]
-                    rounded_seqlen = round_up_seqlen(n)
-                    feature_dict = pad_feature_dict_seq(
-                        feature_dict, rounded_seqlen,
+                n = feature_dict["aatype"].shape[-2]
+                target_seqlen = n
+                if args.pad_seqlen_multiple > 0:
+                    target_seqlen = max(
+                        target_seqlen,
+                        round_up_seqlen_multiple(n, args.pad_seqlen_multiple),
                     )
+                if args.trace_model:
+                    target_seqlen = max(target_seqlen, round_up_seqlen(n))
+                if target_seqlen > n:
+                    logger.info(
+                        f"Padded sequence length {n} -> {target_seqlen} for {tag}"
+                    )
+                    feature_dict = pad_feature_dict_seq(
+                        feature_dict, target_seqlen,
+                    )
+                rounded_seqlen = target_seqlen
 
                 feature_dicts[tag] = feature_dict
 
@@ -336,6 +432,14 @@ def main(args):
                     )
                     cur_tracing_interval = rounded_seqlen
 
+            if args.inference_warmup:
+                run_model(
+                    model,
+                    processed_feature_dict,
+                    tag,
+                    args.output_dir,
+                    record_timings=False,
+                )
             out = run_model(model, processed_feature_dict, tag, args.output_dir)
 
             # Toss out the recycling dimensions --- we don't need them anymore
@@ -455,10 +559,93 @@ if __name__ == "__main__":
         help="""Residue index offset between multiple sequences, if provided"""
     )
     parser.add_argument(
+        "--inference_warmup", action="store_true", default=False,
+        help="""Run a warmup inference step before the main inference to improve
+                steady-state performance."""
+    )
+    parser.add_argument(
         "--trace_model", action="store_true", default=False,
         help="""Whether to convert parts of each model to TorchScript.
                 Significantly improves runtime at the cost of lengthy
                 'compilation.' Useful for large batch jobs."""
+    )
+    parser.add_argument(
+        "--pad_seqlen_multiple",
+        type=int,
+        default=0,
+        help="""If > 0, pad each sequence length up to the next multiple of this
+                value (bucket padding). Fewer distinct shapes help
+                torch.compile/Inductor reuse kernels and on-disk cache across
+                proteins with similar lengths; combines with --trace_model by
+                taking the max of both paddings. Costs extra compute on padded
+                residues (masks preserve correctness). Little benefit for
+                eager-only runs without compile."""
+    )
+    parser.add_argument(
+        "--torch_compile", action="store_true", default=False,
+        help="""Wrap the loaded model with torch.compile (PyTorch 2+). Improves
+                steady-state inference after the first compiled forward pass.
+                Inductor cache defaults to $XDG_CACHE_HOME/openfold/torch_inductor
+                (usually ~/.cache/openfold/torch_inductor); override with
+                --torch_inductor_cache_dir."""
+    )
+    parser.add_argument(
+        "--torch_inductor_cache_dir", type=str, default=None,
+        help="""With --torch_compile: sets TORCHINDUCTOR_CACHE_DIR to this path.
+                If omitted, uses $XDG_CACHE_HOME/openfold/torch_inductor (usually
+                ~/.cache/openfold/torch_inductor). Clears the cache when stale or
+                when --torch_inductor_cache_force_rebuild is set; writes
+                .openfold_inductor_cache_meta.json for checkpoint/version checks."""
+    )
+    parser.add_argument(
+        "--torch_inductor_cache_force_rebuild", action="store_true",
+        default=False,
+        help="""If set with --torch_compile, clears the Inductor cache directory
+                (default or --torch_inductor_cache_dir) before compiling."""
+    )
+    parser.add_argument(
+        "--torch_inductor_no_static_launcher",
+        action="store_true",
+        default=False,
+        help="""With --torch_compile: disable Inductor's static Triton/CUDA kernel
+                launcher (same idea as TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0).
+                Try if you see InductorError / CUDA driver error (e.g. 301) during
+                Triton kernel load; clear the Inductor cache when toggling this."""
+    )
+    parser.add_argument(
+        "--torch_compile_strategy",
+        type=str,
+        choices=("full", "submodules"),
+        default="full",
+        help="""With --torch_compile: \"full\" wraps the entire AlphaFold model
+                (single torch.compile, default mode). \"submodules\" compiles
+                evoformer, structure_module, aux_heads, input_embedder, and
+                recycling_embedder separately; use --torch_compile_evoformer_mode,
+                --torch_compile_structure_module_mode, and
+                --torch_compile_submodule_mode for their mode strings."""
+    )
+    parser.add_argument(
+        "--torch_compile_evoformer_mode",
+        type=str,
+        default=None,
+        help="""torch.compile mode for model.evoformer when
+                --torch_compile_strategy=submodules. Default: PyTorch default
+                mode (omit to use the same as a bare torch.compile).""",
+    )
+    parser.add_argument(
+        "--torch_compile_structure_module_mode",
+        type=str,
+        default=None,
+        help="""torch.compile mode for model.structure_module when
+                --torch_compile_strategy=submodules. Default: PyTorch default.""",
+    )
+    parser.add_argument(
+        "--torch_compile_submodule_mode",
+        type=str,
+        default=None,
+        help="""torch.compile mode for aux_heads, input_embedder, and
+                recycling_embedder when --torch_compile_strategy=submodules.
+                Default: PyTorch default.""",
     )
     parser.add_argument(
         "--subtract_plddt", action="store_true", default=False,

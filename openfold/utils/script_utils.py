@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 
 import numpy
@@ -22,6 +23,275 @@ from pytorch_lightning.utilities.deepspeed import (
 logging.basicConfig()
 logger = logging.getLogger(__file__)
 logger.setLevel(level=logging.INFO)
+
+# Written alongside a dedicated TORCHINDUCTOR_CACHE_DIR to detect stale caches.
+_INDUCTOR_CACHE_META_FILENAME = ".openfold_inductor_cache_meta.json"
+
+
+def _default_torch_inductor_cache_dir():
+    """
+    Default Inductor cache: ``$XDG_CACHE_HOME/openfold/torch_inductor``, or
+    ``$HOME/.cache/openfold/torch_inductor`` when ``XDG_CACHE_HOME`` is unset
+    (XDG default).
+    """
+    cache_home = os.environ.get(
+        "XDG_CACHE_HOME",
+        os.path.join(os.path.expanduser("~"), ".cache"),
+    )
+    return os.path.join(cache_home, "openfold", "torch_inductor")
+
+
+def _apply_torch_inductor_no_static_launcher():
+    """
+    Use Triton's own launcher instead of Inductor's static CUDA launcher.
+    Helps some environments that hit CUDA driver errors inside
+    ``static_triton_launcher.load_kernel`` (e.g. error 301).
+    """
+    try:
+        import torch._inductor.config as inductor_config
+
+        inductor_config.use_static_triton_launcher = False
+        logger.info(
+            "Inductor: static Triton/CUDA launcher disabled "
+            "(equivalent to TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0)."
+        )
+    except Exception as e:
+        logger.warning("Could not disable static Triton launcher: %s", e)
+
+
+def _checkpoint_stat_signature(path):
+    """Stable identity for a weight file or directory used for cache staleness."""
+    if not os.path.exists(path):
+        return None
+    st = os.stat(path)
+    sig = {"mtime_ns": st.st_mtime_ns, "is_dir": os.path.isdir(path)}
+    if os.path.isfile(path):
+        sig["size"] = st.st_size
+    return sig
+
+
+def _read_inductor_cache_meta(cache_dir):
+    p = os.path.join(cache_dir, _INDUCTOR_CACHE_META_FILENAME)
+    if not os.path.isfile(p):
+        return None
+    with open(p, "r") as f:
+        return json.load(f)
+
+
+def _write_inductor_cache_meta(cache_dir, checkpoint_path, stat_sig):
+    os.makedirs(cache_dir, exist_ok=True)
+    meta = {
+        "torch_version": torch.__version__,
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "checkpoint_stat": stat_sig,
+    }
+    path = os.path.join(cache_dir, _INDUCTOR_CACHE_META_FILENAME)
+    if os.path.isfile(path):
+        try:
+            with open(path, "r") as f:
+                existing = json.load(f)
+            if existing == meta:
+                return
+        except (json.JSONDecodeError, OSError):
+            pass
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def _is_inductor_cache_stale(meta, checkpoint_path):
+    if meta is None:
+        return True
+    if meta.get("torch_version") != torch.__version__:
+        return True
+    if meta.get("checkpoint_path") != os.path.abspath(checkpoint_path):
+        return True
+    cur_sig = _checkpoint_stat_signature(checkpoint_path)
+    if cur_sig is None:
+        return True
+    if meta.get("checkpoint_stat") != cur_sig:
+        return True
+    return False
+
+
+def _clear_inductor_cache_dir_contents(cache_dir):
+    """Remove cache entries but keep the directory. Use a dedicated cache_dir."""
+    os.makedirs(cache_dir, exist_ok=True)
+    for name in os.listdir(cache_dir):
+        p = os.path.join(cache_dir, name)
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+        except OSError as e:
+            logger.warning("Could not remove %s: %s", p, e)
+
+
+def _torch_compile_with_optional_mode(module, mode=None):
+    """``torch.compile`` with PyTorch's default when ``mode`` is None."""
+    if mode is None:
+        return torch.compile(module)
+    return torch.compile(module, mode=mode)
+
+
+def _apply_torch_compile_submodules(
+    model,
+    evoformer_mode=None,
+    structure_module_mode=None,
+    embed_heads_mode=None,
+):
+    """
+    Compile major AlphaFold trunk pieces separately so each can use a different
+    ``mode=`` (e.g. Evoformer vs structure module vs embedders/heads).
+    ``None`` uses PyTorch's default ``torch.compile`` mode for that submodule.
+    """
+    model.evoformer = _torch_compile_with_optional_mode(
+        model.evoformer, evoformer_mode
+    )
+    model.structure_module = _torch_compile_with_optional_mode(
+        model.structure_module, structure_module_mode
+    )
+    model.aux_heads = _torch_compile_with_optional_mode(
+        model.aux_heads, embed_heads_mode
+    )
+    model.input_embedder = _torch_compile_with_optional_mode(
+        model.input_embedder, embed_heads_mode
+    )
+    model.recycling_embedder = _torch_compile_with_optional_mode(
+        model.recycling_embedder, embed_heads_mode
+    )
+    return model
+
+
+def maybe_apply_torch_compile(
+    model,
+    torch_compile,
+    torch_inductor_cache_dir,
+    checkpoint_path_for_cache,
+    force_inductor_cache_rebuild,
+    torch_compile_strategy="full",
+    torch_compile_evoformer_mode=None,
+    torch_compile_structure_module_mode=None,
+    torch_compile_submodule_mode=None,
+    torch_inductor_no_static_launcher=False,
+):
+    """
+    Optionally wrap the model with torch.compile and manage a dedicated
+    Inductor cache directory with simple staleness checks (PyTorch version,
+    checkpoint path, and file stats).
+
+    When compiling: a dedicated cache directory is always used. If
+    ``torch_inductor_cache_dir`` is ``None``, it defaults to
+    ``$XDG_CACHE_HOME/openfold/torch_inductor`` (usually
+    ``~/.cache/openfold/torch_inductor``). The directory is created on first
+    use; Inductor writes artifacts there; OpenFold writes staleness metadata
+    when the checkpoint path is valid.
+
+    ``torch_compile_strategy``: ``\"full\"`` compiles the entire ``AlphaFold``
+    module once (default PyTorch compile mode). ``\"submodules\"`` compiles
+    ``evoformer``, ``structure_module``, ``aux_heads``, ``input_embedder``,
+    and ``recycling_embedder`` separately. Mode arguments default to ``None``,
+    i.e. PyTorch's default ``torch.compile`` mode per submodule; pass strings
+    such as ``\"max-autotune\"`` when needed (availability depends on PyTorch).
+    """
+    if not torch_compile:
+        return model
+
+    major = int(torch.__version__.split(".")[0])
+    if major < 2:
+        logger.warning(
+            "torch.compile requires PyTorch 2.0+; skipping torch.compile."
+        )
+        return model
+
+    if torch.version.hip is not None:
+        logger.warning(
+            "ROCm (HIP) build detected: torch.compile/Inductor/Triton support "
+            "varies by ROCm and PyTorch version; stack traces may still mention "
+            "'CUDA' via the compatibility layer. If compilation fails (e.g. kernel "
+            "load errors), run without --torch_compile, or try "
+            "--torch_inductor_no_static_launcher and clear the Inductor cache "
+            "under TORCHINDUCTOR_CACHE_DIR."
+        )
+
+    if torch_inductor_no_static_launcher:
+        _apply_torch_inductor_no_static_launcher()
+
+    effective_cache_dir = (
+        torch_inductor_cache_dir
+        if torch_inductor_cache_dir is not None
+        else _default_torch_inductor_cache_dir()
+    )
+    cache_dir = os.path.abspath(effective_cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    if torch_inductor_cache_dir is None:
+        logger.info(
+            "Using default Inductor cache directory %s "
+            "(override with --torch_inductor_cache_dir).",
+            cache_dir,
+        )
+    meta = _read_inductor_cache_meta(cache_dir)
+    stale = (
+        _is_inductor_cache_stale(meta, checkpoint_path_for_cache)
+        or force_inductor_cache_rebuild
+    )
+    if stale:
+        if force_inductor_cache_rebuild:
+            logger.info(
+                "Clearing Inductor cache at %s (force rebuild).",
+                cache_dir,
+            )
+        elif meta is None and not any(
+            n != _INDUCTOR_CACHE_META_FILENAME
+            for n in os.listdir(cache_dir)
+        ):
+            logger.info(
+                "Using Inductor cache directory %s (created or empty; "
+                "will populate on first compiled forward pass).",
+                cache_dir,
+            )
+        else:
+            logger.info(
+                "Clearing Inductor cache at %s (stale or missing metadata).",
+                cache_dir,
+            )
+        _clear_inductor_cache_dir_contents(cache_dir)
+    else:
+        logger.info(
+            "Reusing Inductor cache at %s (checkpoint and PyTorch version "
+            "match saved metadata).",
+            cache_dir,
+        )
+    sig = _checkpoint_stat_signature(checkpoint_path_for_cache)
+    if sig is None:
+        logger.warning(
+            "Checkpoint path %s not found; skipping torch.compile.",
+            checkpoint_path_for_cache,
+        )
+        return model
+
+    if torch_compile_strategy == "submodules":
+        logger.info(
+            "Applying torch.compile per submodule (evoformer=%r, "
+            "structure_module=%r, aux_heads/embedders=%r).",
+            torch_compile_evoformer_mode,
+            torch_compile_structure_module_mode,
+            torch_compile_submodule_mode,
+        )
+        model = _apply_torch_compile_submodules(
+            model,
+            evoformer_mode=torch_compile_evoformer_mode,
+            structure_module_mode=torch_compile_structure_module_mode,
+            embed_heads_mode=torch_compile_submodule_mode,
+        )
+    else:
+        logger.info("Applying torch.compile to the full model (default mode).")
+        model = torch.compile(model)
+
+    if sig is not None:
+        _write_inductor_cache_meta(cache_dir, checkpoint_path_for_cache, sig)
+    return model
 
 
 def count_models_to_evaluate(openfold_checkpoint_path, jax_param_path):
@@ -50,7 +320,21 @@ def make_output_directory(output_dir, model_name, multiple_model_mode):
     return prediction_dir
 
 
-def load_models_from_command_line(config, model_device, openfold_checkpoint_path, jax_param_path, output_dir):
+def load_models_from_command_line(
+    config,
+    model_device,
+    openfold_checkpoint_path,
+    jax_param_path,
+    output_dir,
+    torch_compile=False,
+    torch_inductor_cache_dir=None,
+    force_inductor_cache_rebuild=False,
+    torch_compile_strategy="full",
+    torch_compile_evoformer_mode=None,
+    torch_compile_structure_module_mode=None,
+    torch_compile_submodule_mode=None,
+    torch_inductor_no_static_launcher=False,
+):
     # Create the output directory
 
     multiple_model_mode = count_models_to_evaluate(openfold_checkpoint_path, jax_param_path) > 1
@@ -67,6 +351,18 @@ def load_models_from_command_line(config, model_device, openfold_checkpoint_path
                 model, path, version=model_version
             )
             model = model.to(model_device)
+            model = maybe_apply_torch_compile(
+                model,
+                torch_compile,
+                torch_inductor_cache_dir,
+                path,
+                force_inductor_cache_rebuild,
+                torch_compile_strategy=torch_compile_strategy,
+                torch_compile_evoformer_mode=torch_compile_evoformer_mode,
+                torch_compile_structure_module_mode=torch_compile_structure_module_mode,
+                torch_compile_submodule_mode=torch_compile_submodule_mode,
+                torch_inductor_no_static_launcher=torch_inductor_no_static_launcher,
+            )
             logger.info(
                 f"Successfully loaded JAX parameters at {path}..."
             )
@@ -102,6 +398,18 @@ def load_models_from_command_line(config, model_device, openfold_checkpoint_path
                 import_openfold_weights_(model=model, state_dict=d)
 
             model = model.to(model_device)
+            model = maybe_apply_torch_compile(
+                model,
+                torch_compile,
+                torch_inductor_cache_dir,
+                ckpt_path,
+                force_inductor_cache_rebuild,
+                torch_compile_strategy=torch_compile_strategy,
+                torch_compile_evoformer_mode=torch_compile_evoformer_mode,
+                torch_compile_structure_module_mode=torch_compile_structure_module_mode,
+                torch_compile_submodule_mode=torch_compile_submodule_mode,
+                torch_inductor_no_static_launcher=torch_inductor_no_static_launcher,
+            )
             logger.info(
                 f"Loaded OpenFold parameters at {path}..."
             )
@@ -147,7 +455,7 @@ def update_timings(timing_dict, output_file=os.path.join(os.getcwd(), "timings.j
     return output_file
 
 
-def run_model(model, batch, tag, output_dir):
+def run_model(model, batch, tag, output_dir, record_timings=True):
     with torch.no_grad():
         # Temporarily disable templates if there aren't any in the batch
         template_enabled = model.config.template.enabled
@@ -155,12 +463,19 @@ def run_model(model, batch, tag, output_dir):
             "template_" in k for k in batch
         ])
 
-        logger.info(f"Running inference for {tag}...")
+
+        if record_timings:
+            logger.info(f"Running inference for {tag}...")
+        else:
+            logger.info(f"Warmup inference for {tag} (not recorded in timings.json)...")
         t = time.perf_counter()
         out = model(batch)
         inference_time = time.perf_counter() - t
-        logger.info(f"Inference time: {inference_time}")
-        update_timings({tag: {"inference": inference_time}}, os.path.join(output_dir, "timings.json"))
+        if record_timings:
+            logger.info(f"Inference time: {inference_time}")
+            update_timings({tag: {"inference": inference_time}}, os.path.join(output_dir, "timings.json"))
+        else:
+            logger.info(f"Warmup inference time: {inference_time} (not recorded)")
 
         model.config.template.enabled = template_enabled
 
